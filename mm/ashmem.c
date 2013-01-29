@@ -626,6 +626,69 @@ static int ashmem_pin_unpin(struct ashmem_area *asma, unsigned long cmd,
 	return ret;
 }
 
+#ifdef CONFIG_OUTER_CACHE
+static unsigned int virtaddr_to_physaddr(unsigned int virtaddr)
+{
+	unsigned int physaddr = 0;
+	pgd_t *pgd_ptr = NULL;
+	pmd_t *pmd_ptr = NULL;
+	pte_t *pte_ptr = NULL, pte;
+
+	spin_lock(&current->mm->page_table_lock);
+	pgd_ptr = pgd_offset(current->mm, virtaddr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd)) {
+		pr_err("Failed to convert virtaddr %x to pgd_ptr\n",
+			virtaddr);
+		goto done;
+	}
+
+	pmd_ptr = pmd_offset(pgd_ptr, virtaddr);
+	if (pmd_none(*pmd_ptr) || pmd_bad(*pmd_ptr)) {
+		pr_err("Failed to convert pgd_ptr %p to pmd_ptr\n",
+			(void *)pgd_ptr);
+		goto done;
+	}
+
+	pte_ptr = pte_offset_map(pmd_ptr, virtaddr);
+	if (!pte_ptr) {
+		pr_err("Failed to convert pmd_ptr %p to pte_ptr\n",
+			(void *)pmd_ptr);
+		goto done;
+	}
+	pte = *pte_ptr;
+	physaddr = pte_pfn(pte);
+	pte_unmap(pte_ptr);
+done:
+	spin_unlock(&current->mm->page_table_lock);
+	physaddr <<= PAGE_SHIFT;
+	return physaddr;
+}
+#endif
+
+static int ashmem_cache_op(struct ashmem_area *asma,
+	void (*cache_func)(unsigned long vstart, unsigned long length,
+				unsigned long pstart))
+{
+#ifdef CONFIG_OUTER_CACHE
+	unsigned long vaddr;
+#endif
+	mutex_lock(&ashmem_mutex);
+#ifndef CONFIG_OUTER_CACHE
+	cache_func(asma->vm_start, asma->size, 0);
+#else
+	for (vaddr = asma->vm_start; vaddr < asma->vm_start + asma->size;
+		vaddr += PAGE_SIZE) {
+		unsigned long physaddr;
+		physaddr = virtaddr_to_physaddr(vaddr);
+		if (!physaddr)
+			return -EINVAL;
+		cache_func(vaddr, PAGE_SIZE, physaddr);
+	}
+#endif
+	mutex_unlock(&ashmem_mutex);
+	return 0;
+}
+
 static long ashmem_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct ashmem_area *asma = file->private_data;
@@ -662,9 +725,23 @@ static long ashmem_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case ASHMEM_PURGE_ALL_CACHES:
 		ret = -EPERM;
 		if (capable(CAP_SYS_ADMIN)) {
-			ret = ashmem_shrink(&ashmem_shrinker, 0, GFP_KERNEL);
-			ashmem_shrink(&ashmem_shrinker, ret, GFP_KERNEL);
+			struct shrink_control sc = {
+				.gfp_mask = GFP_KERNEL,
+				.nr_to_scan = 0,
+			};
+			ret = ashmem_shrink(&ashmem_shrinker, sc.nr_to_scan, sc.gfp_mask);
+			sc.nr_to_scan = ret;
+			ashmem_shrink(&ashmem_shrinker, sc.nr_to_scan, sc.gfp_mask);
 		}
+		break;
+	case ASHMEM_CACHE_FLUSH_RANGE:
+		ret = ashmem_cache_op(asma, &clean_and_invalidate_caches);
+		break;
+	case ASHMEM_CACHE_CLEAN_RANGE:
+		ret = ashmem_cache_op(asma, &clean_caches);
+		break;
+	case ASHMEM_CACHE_INV_RANGE:
+		ret = ashmem_cache_op(asma, &invalidate_caches);
 		break;
 	}
 
